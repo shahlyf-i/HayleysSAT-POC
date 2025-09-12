@@ -6,9 +6,9 @@ from azure.ai.documentintelligence import DocumentIntelligenceClient
 # ------------------------------
 # Azure Custom Model Settings
 # ------------------------------
-endpoint = "https://doccumentintelligence-hj.cognitiveservices.azure.com/"
-key = "2OkUaL4tDwRAFUpcO9YEyvXvXuSFxXdGLZIUTSjd8A7DXa5hEjiwJQQJ99BHACYeBjFXJ3w3AAALACOGIXxL"  
-model_id = "HayleysPOC1"
+endpoint = st.secrets["ENDPOINT"]
+key = st.secrets["KEY"]
+model_id = st.secrets["MODEL_ID"]
 
 client = DocumentIntelligenceClient(endpoint=endpoint, credential=AzureKeyCredential(key))
 
@@ -91,7 +91,7 @@ if uploaded_files:
                 for table_idx, df in enumerate(tables):
                     st.write(f"Table {table_idx + 1} (Editable)")
                     
-                    # ✅ Editable table
+                    # Editable table
                     edited_df = st.data_editor(df, num_rows="dynamic")
                     
                     # Download button for edited table
