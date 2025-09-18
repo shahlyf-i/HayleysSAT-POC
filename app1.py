@@ -1,6 +1,9 @@
 # app1.py — In-cell highlights (yellow/red only) with readable text
-# pip install -U streamlit streamlit-aggrid azure-ai-documentintelligence pandas
+# Finetuned sanitizers:
+#  - MC  : keep LEFT-MOST number only (e.g., "22 84" -> "22")
+#  - RPM : keep FIRST TWO DIGITS of the LEFT-MOST number (e.g., "2050" -> "20")
 
+import re
 import math
 import pandas as pd
 import streamlit as st
@@ -69,6 +72,44 @@ def normalize_conf(v):
         v /= 100.0
     return max(0.0, min(1.0, v))
 
+# ---------- NEW: sanitizers ----------
+def _leftmost_digits(text: str) -> str:
+    """
+    Return the left-most run of digits in text (e.g., '22 84' -> '22').
+    If no digits are found, return the original text unchanged.
+    """
+    s = str(text)
+    m = re.search(r'\d+', s)
+    return m.group(0) if m else s
+
+def _leftmost_two_digits(text: str) -> str:
+    """
+    Take the left-most run of digits, then keep only its first two digits.
+    Examples: '2050' -> '20', '22 24' -> '22', '8A' -> '8'
+    If no digits are found, return the original text unchanged.
+    """
+    first = _leftmost_digits(text)
+    return first[:2] if first and first[0].isdigit() else first
+
+def sanitize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply per-column cleanup:
+      - MC  : left-most number only
+      - RPM : first two digits of the left-most number
+    Matches columns case-insensitively and allows suffixes like '_1'.
+    """
+    if df.empty:
+        return df
+
+    for col in df.columns:
+        name = str(col).strip().lower()
+        if re.fullmatch(r'mc(?:_\d+)?', name):
+            df[col] = df[col].astype(str).map(_leftmost_digits)
+        elif re.fullmatch(r'rpm(?:_\d+)?', name):
+            df[col] = df[col].astype(str).map(_leftmost_two_digits)
+    return df
+# ------------------------------------
+
 # -----------------------------
 # Extract (values + confidence)
 # -----------------------------
@@ -132,6 +173,9 @@ def extract_tables_with_confidence(uploaded_file):
             df_conf.columns = df_vals.columns
             df_vals = df_vals[1:].reset_index(drop=True)
             df_conf = df_conf[1:].reset_index(drop=True)
+
+            # ---------- apply the new sanitizers here ----------
+            df_vals = sanitize_columns(df_vals)
 
         out.append({"values": df_vals, "scores": df_conf})
 
