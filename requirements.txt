@@ -2,3 +2,4 @@ streamlit
 pandas
 azure-ai-documentintelligence
 azure-core
+streamlit-aggrid

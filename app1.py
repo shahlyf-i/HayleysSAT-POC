@@ -1,14 +1,24 @@
-# app1.py
-import streamlit as st
-import pandas as pd
+# app1.py — In-cell highlights (yellow/red only) with readable text
+# pip install -U streamlit streamlit-aggrid azure-ai-documentintelligence pandas
+
 import math
+import pandas as pd
+import streamlit as st
 
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.ai.documentintelligence.models import DocumentAnalysisFeature
 
+from st_aggrid import (
+    AgGrid,
+    GridOptionsBuilder,
+    GridUpdateMode,
+    JsCode,
+    AgGridTheme,
+)
+
 # -----------------------------
-# Secrets
+# Secrets (set in .streamlit/secrets.toml)
 # -----------------------------
 endpoint = st.secrets["ENDPOINT"]
 key = st.secrets["KEY"]
@@ -31,7 +41,7 @@ def deduplicate_columns(columns):
     return out
 
 def point_in_polygon(x, y, polygon):
-    pts = [(polygon[i], polygon[i+1]) for i in range(0, len(polygon), 2)]
+    pts = [(polygon[i], polygon[i + 1]) for i in range(0, len(polygon), 2)]
     inside = False
     j = len(pts) - 1
     for i in range(len(pts)):
@@ -45,53 +55,34 @@ def point_in_polygon(x, y, polygon):
 
 def polygon_center(poly):
     xs, ys = poly[0::2], poly[1::2]
-    return sum(xs)/len(xs), sum(ys)/len(ys)
+    return sum(xs) / len(xs), sum(ys) / len(ys)
 
 def normalize_conf(v):
-    """
-    Normalize Azure confidence to 0..1 float.
-    Accepts None, NaN, 0..1, or 0..100.
-    """
+    """Normalize Azure confidence to 0..1; NaN if missing."""
     if v is None or (isinstance(v, float) and math.isnan(v)):
         return math.nan
     try:
         v = float(v)
     except Exception:
         return math.nan
-    # If already 0..1, keep it. If looks like 0..100, scale down.
     if v > 1.0:
-        v = v / 100.0
-    # Clamp
-    v = max(0.0, min(1.0, v))
-    return v
-
-def conf_icon(pct, g=0.70, y=0.50):
-    """
-    Return colored icon string for confidence percentage (0..100).
-    🟩 >= g*100, 🟨 >= y*100, else 🟥
-    """
-    if math.isnan(pct):
-        return "—"
-    if pct >= g * 100:
-        return "🟩"
-    if pct >= y * 100:
-        return "🟨"
-    return "🟥"
+        v /= 100.0
+    return max(0.0, min(1.0, v))
 
 # -----------------------------
 # Extract (values + confidence)
 # -----------------------------
 def extract_tables_with_confidence(uploaded_file):
     """
-    Returns: list of {"values": DataFrame[str], "scores": DataFrame[float 0..1 or NaN]}
-    Uses cell.confidence when available; otherwise falls back to OCR words.
+    Returns list of {"values": df_vals (str), "scores": df_conf (0..1 or NaN)}.
+    Uses cell.confidence when available; otherwise estimates from OCR word confidences.
     """
     pdf_bytes = uploaded_file.read()
     poller = client.begin_analyze_document(
         model_id=model_id,
         body=pdf_bytes,
         content_type="application/pdf",
-        features=[DocumentAnalysisFeature.OCR_HIGH_RESOLUTION]
+        features=[DocumentAnalysisFeature.OCR_HIGH_RESOLUTION],
     )
     result = poller.result()
 
@@ -112,10 +103,10 @@ def extract_tables_with_confidence(uploaded_file):
             r, c = cell.row_index, cell.column_index
             grid_vals[r][c] = cell.content or ""
 
-            # 1) Try model-provided confidence
+            # 1) model-provided confidence
             conf = getattr(cell, "confidence", None)
 
-            # 2) Fallback to OCR words inside the cell polygon (mean)
+            # 2) fallback: average word confidences inside the cell polygon
             if (conf is None) and cell.bounding_regions:
                 br = cell.bounding_regions[0]
                 page = pages.get(br.page_number)
@@ -128,7 +119,7 @@ def extract_tables_with_confidence(uploaded_file):
                             if point_in_polygon(cx, cy, poly):
                                 scores.append(float(w.confidence))
                     if scores:
-                        conf = sum(scores) / len(scores)  # mean is smoother than min
+                        conf = sum(scores) / len(scores)
 
             grid_conf[r][c] = normalize_conf(conf)
 
@@ -147,85 +138,87 @@ def extract_tables_with_confidence(uploaded_file):
     return out
 
 # -----------------------------
-# Build editor with icons
+# AgGrid editor with in-cell highlight (readable text)
 # -----------------------------
-def build_editor_with_conf(df_vals: pd.DataFrame, df_conf: pd.DataFrame, green_cut=0.70, yellow_cut=0.50):
+def aggrid_editor_colored(df_vals: pd.DataFrame, df_conf: pd.DataFrame,
+                          yellow_cut=0.50, green_cut=0.70, height=460):
     """
-    Interleave columns: Value, Value (conf) where the conf column is a read-only text like '78% 🟩'.
+    Editable value cells with background highlight:
+      - < yellow_cut  → red  (#FFCDD2) with black bold text
+      - yellow_cut..green_cut  → yellow (#FFF9C4) with black bold text
+      - ≥ green_cut → no color (no green)
+    Confidence is stored in hidden columns __conf__<col>.
     """
-    data = {}
-    order = []
+    merged = df_vals.copy()
     for col in df_vals.columns:
-        # values
-        data[col] = df_vals[col]
-        order.append(col)
+        merged[f"__conf__{col}"] = df_conf[col]
 
-        # confidence (text + icon)
-        conf_col = f"{col} (conf)"
-        vals = []
-        for v in df_conf[col].tolist():
-            pct = (v * 100.0) if pd.notna(v) else float('nan')
-            icon = conf_icon(pct, g=green_cut, y=yellow_cut)
-            if pd.isna(pct):
-                vals.append("—")
-            else:
-                vals.append(f"{int(round(pct))}% {icon}")
-        data[conf_col] = vals
-        order.append(conf_col)
+    js_style = JsCode(f"""
+        function(params){{
+            var key = "__conf__" + params.colDef.field;
+            var v = params.data[key];
+            if (v === null || v === undefined || isNaN(v)) return {{}};
+            if (v >= {green_cut}) return {{}}; // high → no highlight
+            if (v >= {yellow_cut}) {{
+                return {{'backgroundColor': '#FFF9C4', 'color': '#111111', 'fontWeight': '600',
+                         'border': '1px solid #9CA3AF'}}; // yellow, black bold text
+            }}
+            return {{'backgroundColor': '#FFCDD2', 'color': '#111111', 'fontWeight': '600',
+                     'border': '1px solid #9CA3AF'}};     // red, black bold text
+        }}
+    """)
 
-    editor_df = pd.DataFrame(data)[order]
-    # Mark only the conf columns as disabled
-    disabled_cols = [c for c in editor_df.columns if c.endswith("(conf)")]
-    # Column config: make conf text non-editable and fixed width
-    col_config = {c: st.column_config.TextColumn(c, disabled=True) for c in disabled_cols}
-    return editor_df, disabled_cols, col_config
+    gob = GridOptionsBuilder.from_dataframe(merged, editable=True)
+    for col in df_vals.columns:
+        gob.configure_column(col, editable=True, cellStyle=js_style)
+        gob.configure_column(f"__conf__{col}", hide=True, editable=False)
+
+    grid = AgGrid(
+        merged,
+        gridOptions=gob.build(),
+        update_mode=GridUpdateMode.VALUE_CHANGED,
+        allow_unsafe_jscode=True,
+        fit_columns_on_grid_load=True,
+        theme=AgGridTheme.STREAMLIT,   # valid: STREAMLIT, BALHAM, ALPINE, MATERIAL
+        height=height,
+    )
+    edited = pd.DataFrame(grid["data"])
+    value_cols = [c for c in edited.columns if not c.startswith("__conf__")]
+    return edited[value_cols]
 
 # -----------------------------
 # UI
 # -----------------------------
-st.set_page_config(page_title="PDF Table Extractor (with Confidence)", layout="wide")
+st.set_page_config(page_title="PDF Table Extractor (in-cell highlights)", layout="wide")
 st.title("Custom PDF Table Extractor (Azure Document Intelligence)")
 
-uploaded_files = st.file_uploader("Upload one or more PDF files", type=["pdf"], accept_multiple_files=True)
+files = st.file_uploader("Upload one or more PDF files", type=["pdf"], accept_multiple_files=True)
 
-if uploaded_files:
-    # Thresholds (you asked green at ≥70%)
-    green_cut = st.slider("Green at ≥ this %", 50, 95, 70, 1) / 100.0
-    yellow_cut = st.slider("Yellow lower bound %", 30, 69, 50, 1) / 100.0
+if files:
+    # Only yellow/red; green is intentionally not shown
+    green_cut = st.slider("High-confidence threshold (no color when ≥)", 60, 95, 70, 1) / 100.0
+    yellow_cut = st.slider("Yellow threshold (≥)", 30, 69, 50, 1) / 100.0
 
-    for uploaded_file in uploaded_files:
-        st.subheader(f"Results for: {uploaded_file.name}")
-
-        tables = extract_tables_with_confidence(uploaded_file)
+    for up in files:
+        st.subheader(f"Results for: {up.name}")
+        tables = extract_tables_with_confidence(up)
         if not tables:
             st.warning("No tables detected in this PDF.")
             continue
 
         for i, t in enumerate(tables, start=1):
             df_vals, df_conf = t["values"], t["scores"]
-
             pct_scored = (df_conf.notna().sum().sum() / df_conf.size * 100) if df_conf.size else 0
             st.caption(f"Cells with confidence available: {pct_scored:.1f}%")
 
-            st.markdown(f"**Table {i} – Editable (values + confidence)**")
-            editor_df, disabled_cols, conf_config = build_editor_with_conf(
-                df_vals, df_conf, green_cut=green_cut, yellow_cut=yellow_cut
+            st.markdown(f"**Table {i} – Editable (in-cell highlights: yellow/red only)**")
+            edited_values = aggrid_editor_colored(
+                df_vals, df_conf, yellow_cut=yellow_cut, green_cut=green_cut
             )
 
-            edited_df = st.data_editor(
-                editor_df,
-                num_rows="dynamic",
-                use_container_width=True,
-                disabled=disabled_cols,
-                column_config=conf_config
-            )
-
-            # Download: values only (strip the confidence columns)
-            value_cols = [c for c in edited_df.columns if not c.endswith("(conf)")]
-            clean_values = edited_df[value_cols]
             st.download_button(
-                label=f"Download Edited Table {i} (values only) as CSV",
-                data=clean_values.to_csv(index=False).encode("utf-8"),
-                file_name=f"{uploaded_file.name}_table{i}_edited.csv",
+                f"Download Edited Table {i} as CSV",
+                edited_values.to_csv(index=False).encode("utf-8"),
+                file_name=f"{up.name}_table{i}_edited.csv",
                 mime="text/csv",
             )
