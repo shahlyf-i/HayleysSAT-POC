@@ -1,7 +1,6 @@
-# app1.py — In-cell highlights (yellow/red only) with readable text
-# Finetuned sanitizers:
-#  - MC  : keep LEFT-MOST number only (e.g., "22 84" -> "22")
-#  - RPM : keep FIRST TWO DIGITS of the LEFT-MOST number (e.g., "2050" -> "20")
+# app1.py — Original extraction + MC/RPM tidy + in-cell yellow/red highlights
+# AG-Grid safe field-ids so headers like "Revolution 10:30" render correctly
+# pip install -U streamlit streamlit-aggrid azure-ai-documentintelligence pandas
 
 import re
 import math
@@ -21,16 +20,15 @@ from st_aggrid import (
 )
 
 # -----------------------------
-# Secrets (set in .streamlit/secrets.toml)
+# Secrets
 # -----------------------------
 endpoint = st.secrets["ENDPOINT"]
 key = st.secrets["KEY"]
 model_id = st.secrets["MODEL_ID"]
-
 client = DocumentIntelligenceClient(endpoint=endpoint, credential=AzureKeyCredential(key))
 
 # -----------------------------
-# Helpers
+# Helpers (unchanged)
 # -----------------------------
 def deduplicate_columns(columns):
     seen, out = {}, []
@@ -61,63 +59,41 @@ def polygon_center(poly):
     return sum(xs) / len(xs), sum(ys) / len(ys)
 
 def normalize_conf(v):
-    """Normalize Azure confidence to 0..1; NaN if missing."""
-    if v is None or (isinstance(v, float) and math.isnan(v)):
+    if v is None:
         return math.nan
     try:
         v = float(v)
     except Exception:
         return math.nan
-    if v > 1.0:
+    if v > 1.0:  # sometimes 0..100
         v /= 100.0
     return max(0.0, min(1.0, v))
 
-# ---------- NEW: sanitizers ----------
+# (Optional) MC/RPM tidy — affects only those columns
 def _leftmost_digits(text: str) -> str:
-    """
-    Return the left-most run of digits in text (e.g., '22 84' -> '22').
-    If no digits are found, return the original text unchanged.
-    """
-    s = str(text)
-    m = re.search(r'\d+', s)
-    return m.group(0) if m else s
+    m = re.search(r'\d+', str(text))
+    return m.group(0) if m else str(text)
 
 def _leftmost_two_digits(text: str) -> str:
-    """
-    Take the left-most run of digits, then keep only its first two digits.
-    Examples: '2050' -> '20', '22 24' -> '22', '8A' -> '8'
-    If no digits are found, return the original text unchanged.
-    """
     first = _leftmost_digits(text)
     return first[:2] if first and first[0].isdigit() else first
 
-def sanitize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Apply per-column cleanup:
-      - MC  : left-most number only
-      - RPM : first two digits of the left-most number
-    Matches columns case-insensitively and allows suffixes like '_1'.
-    """
+def sanitize_mc_rpm(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-
     for col in df.columns:
         name = str(col).strip().lower()
-        if re.fullmatch(r'mc(?:_\d+)?', name):
+        if name == "mc" or re.fullmatch(r"mc_\d+", name):
             df[col] = df[col].astype(str).map(_leftmost_digits)
-        elif re.fullmatch(r'rpm(?:_\d+)?', name):
+        elif name == "rpm" or re.fullmatch(r"rpm_\d+", name):
             df[col] = df[col].astype(str).map(_leftmost_two_digits)
     return df
-# ------------------------------------
 
 # -----------------------------
-# Extract (values + confidence)
+# Extraction — SAME as your “working” pattern
+# (no value rebuild, no merging; just cell.content + confidence fallback)
 # -----------------------------
 def extract_tables_with_confidence(uploaded_file):
-    """
-    Returns list of {"values": df_vals (str), "scores": df_conf (0..1 or NaN)}.
-    Uses cell.confidence when available; otherwise estimates from OCR word confidences.
-    """
     pdf_bytes = uploaded_file.read()
     poller = client.begin_analyze_document(
         model_id=model_id,
@@ -142,17 +118,15 @@ def extract_tables_with_confidence(uploaded_file):
 
         for cell in table.cells:
             r, c = cell.row_index, cell.column_index
-            grid_vals[r][c] = cell.content or ""
+            grid_vals[r][c] = cell.content or ""  # <- exactly the original behavior
 
-            # 1) model-provided confidence
+            # confidence: cell.conf or mean of word confidences inside polygon
             conf = getattr(cell, "confidence", None)
-
-            # 2) fallback: average word confidences inside the cell polygon
-            if (conf is None) and cell.bounding_regions:
+            if conf is None and cell.bounding_regions:
                 br = cell.bounding_regions[0]
                 page = pages.get(br.page_number)
                 poly = br.polygon
-                if page and page.words and poly:
+                if page and getattr(page, "words", None) and poly:
                     scores = []
                     for w in page.words:
                         if w.polygon and (w.confidence is not None):
@@ -161,61 +135,72 @@ def extract_tables_with_confidence(uploaded_file):
                                 scores.append(float(w.confidence))
                     if scores:
                         conf = sum(scores) / len(scores)
-
             grid_conf[r][c] = normalize_conf(conf)
 
         df_vals = pd.DataFrame(grid_vals)
         df_conf = pd.DataFrame(grid_conf)
 
-        # Promote first row to header
         if not df_vals.empty:
             df_vals.columns = deduplicate_columns(df_vals.iloc[0].astype(str))
             df_conf.columns = df_vals.columns
             df_vals = df_vals[1:].reset_index(drop=True)
             df_conf = df_conf[1:].reset_index(drop=True)
-
-            # ---------- apply the new sanitizers here ----------
-            df_vals = sanitize_columns(df_vals)
+            df_vals = sanitize_mc_rpm(df_vals)  # tidy only MC/RPM
 
         out.append({"values": df_vals, "scores": df_conf})
 
     return out
 
 # -----------------------------
-# AgGrid editor with in-cell highlight (readable text)
+# AG-Grid editor — yellow/red only, with SAFE field ids
 # -----------------------------
-def aggrid_editor_colored(df_vals: pd.DataFrame, df_conf: pd.DataFrame,
-                          yellow_cut=0.50, green_cut=0.70, height=460):
+def aggrid_editor_yellow_red(df_vals, df_conf, yellow_cut=0.50, green_cut=0.70, height=460):
     """
-    Editable value cells with background highlight:
-      - < yellow_cut  → red  (#FFCDD2) with black bold text
-      - yellow_cut..green_cut  → yellow (#FFF9C4) with black bold text
-      - ≥ green_cut → no color (no green)
-    Confidence is stored in hidden columns __conf__<col>.
+    Uses safe field ids so headers like 'Revolution 10:30' render properly.
+    Returns DataFrame with ORIGINAL column names.
     """
-    merged = df_vals.copy()
-    for col in df_vals.columns:
-        merged[f"__conf__{col}"] = df_conf[col]
+    if df_vals.empty:
+        return df_vals.copy()
 
+    # Build safe ids for AG Grid fields
+    orig_cols = list(df_vals.columns)
+    safe_cols, used = [], set()
+    for c in orig_cols:
+        k = re.sub(r"[^A-Za-z0-9_]", "_", str(c)) or "col"
+        while k in used:
+            k += "_"
+        used.add(k)
+        safe_cols.append(k)
+
+    # Re-label values and conf with safe ids
+    vals_display = df_vals.copy()
+    vals_display.columns = safe_cols
+
+    conf_display = df_conf.copy()
+    conf_display.columns = [f"__conf__{k}" for k in safe_cols]
+
+    merged = pd.concat([vals_display, conf_display], axis=1)
+
+    # Yellow if >= yellow_cut and < green_cut; Red if < yellow_cut; no green fill
     js_style = JsCode(f"""
         function(params){{
-            var key = "__conf__" + params.colDef.field;
-            var v = params.data[key];
+            var k = "__conf__" + params.colDef.field;
+            var v = params.data[k];
             if (v === null || v === undefined || isNaN(v)) return {{}};
-            if (v >= {green_cut}) return {{}}; // high → no highlight
+            if (v >= {green_cut}) return {{}};
             if (v >= {yellow_cut}) {{
-                return {{'backgroundColor': '#FFF9C4', 'color': '#111111', 'fontWeight': '600',
-                         'border': '1px solid #9CA3AF'}}; // yellow, black bold text
+                return {{backgroundColor: '#FFF9C4', color: '#111', fontWeight: '600',
+                         border: '1px solid #9CA3AF'}};
             }}
-            return {{'backgroundColor': '#FFCDD2', 'color': '#111111', 'fontWeight': '600',
-                     'border': '1px solid #9CA3AF'}};     // red, black bold text
+            return {{backgroundColor: '#FFCDD2', color: '#111', fontWeight: '600',
+                     border: '1px solid #9CA3AF'}};
         }}
     """)
 
     gob = GridOptionsBuilder.from_dataframe(merged, editable=True)
-    for col in df_vals.columns:
-        gob.configure_column(col, editable=True, cellStyle=js_style)
-        gob.configure_column(f"__conf__{col}", hide=True, editable=False)
+    for safe, orig in zip(safe_cols, orig_cols):
+        gob.configure_column(safe, header_name=str(orig), editable=True, cellStyle=js_style)
+        gob.configure_column(f"__conf__{safe}", hide=True, editable=False)
 
     grid = AgGrid(
         merged,
@@ -223,25 +208,26 @@ def aggrid_editor_colored(df_vals: pd.DataFrame, df_conf: pd.DataFrame,
         update_mode=GridUpdateMode.VALUE_CHANGED,
         allow_unsafe_jscode=True,
         fit_columns_on_grid_load=True,
-        theme=AgGridTheme.STREAMLIT,   # valid: STREAMLIT, BALHAM, ALPINE, MATERIAL
+        theme=AgGridTheme.STREAMLIT,
         height=height,
     )
+
     edited = pd.DataFrame(grid["data"])
-    value_cols = [c for c in edited.columns if not c.startswith("__conf__")]
-    return edited[value_cols]
+    edited_vals = edited[safe_cols].copy()
+    edited_vals.columns = orig_cols  # map back to original headers
+    return edited_vals
 
 # -----------------------------
 # UI
 # -----------------------------
-st.set_page_config(page_title="PDF Table Extractor (in-cell highlights)", layout="wide")
+st.set_page_config(page_title="PDF Table Extractor (yellow/red highlights)", layout="wide")
 st.title("Custom PDF Table Extractor (Azure Document Intelligence)")
 
 files = st.file_uploader("Upload one or more PDF files", type=["pdf"], accept_multiple_files=True)
 
 if files:
-    # Only yellow/red; green is intentionally not shown
-    green_cut = st.slider("High-confidence threshold (no color when ≥)", 60, 95, 70, 1) / 100.0
-    yellow_cut = st.slider("Yellow threshold (≥)", 30, 69, 50, 1) / 100.0
+    green_cut = st.slider("No color when ≥", 60, 95, 70, 1) / 100.0
+    yellow_cut = st.slider("Yellow when ≥", 30, 69, 50, 1) / 100.0
 
     for up in files:
         st.subheader(f"Results for: {up.name}")
@@ -255,8 +241,8 @@ if files:
             pct_scored = (df_conf.notna().sum().sum() / df_conf.size * 100) if df_conf.size else 0
             st.caption(f"Cells with confidence available: {pct_scored:.1f}%")
 
-            st.markdown(f"**Table {i} – Editable (in-cell highlights: yellow/red only)**")
-            edited_values = aggrid_editor_colored(
+            st.markdown(f"**Table {i} – Editable (yellow/red only)**")
+            edited_values = aggrid_editor_yellow_red(
                 df_vals, df_conf, yellow_cut=yellow_cut, green_cut=green_cut
             )
 
