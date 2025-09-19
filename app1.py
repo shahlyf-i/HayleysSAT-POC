@@ -1,5 +1,6 @@
-# app1.py — Original extraction + MC/RPM tidy + in-cell yellow/red highlights
-# AG-Grid safe field-ids so headers like "Revolution 10:30" render correctly
+# app1.py — Original extraction + MC/RPM tidy + yellow/red highlights
+# Plus: when a cell has multiple 3–5 digit numbers (e.g., corrected value
+# written above the old one), keep the TOP-MOST number only.
 # pip install -U streamlit streamlit-aggrid azure-ai-documentintelligence pandas
 
 import re
@@ -28,7 +29,7 @@ model_id = st.secrets["MODEL_ID"]
 client = DocumentIntelligenceClient(endpoint=endpoint, credential=AzureKeyCredential(key))
 
 # -----------------------------
-# Helpers (unchanged)
+# Helpers
 # -----------------------------
 def deduplicate_columns(columns):
     seen, out = {}, []
@@ -69,7 +70,7 @@ def normalize_conf(v):
         v /= 100.0
     return max(0.0, min(1.0, v))
 
-# (Optional) MC/RPM tidy — affects only those columns
+# Keep only left-most for MC, first two digits for RPM
 def _leftmost_digits(text: str) -> str:
     m = re.search(r'\d+', str(text))
     return m.group(0) if m else str(text)
@@ -89,9 +90,30 @@ def sanitize_mc_rpm(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = df[col].astype(str).map(_leftmost_two_digits)
     return df
 
+# ---- NEW: choose TOP-MOST numeric token when multiple numbers are present ----
+def _topmost_numeric_from_words(page, polygon, min_len=3, max_len=5):
+    """
+    Return the top-most token that is purely numeric with length in [min_len, max_len].
+    """
+    if not page or not getattr(page, "words", None) or not polygon:
+        return ""
+    candidates = []
+    for w in page.words:
+        if not (w.polygon and w.content):
+            continue
+        s = w.content.strip()
+        if not re.fullmatch(rf"\d{{{min_len},{max_len}}}", s):
+            continue
+        cx, cy = polygon_center(w.polygon)
+        if point_in_polygon(cx, cy, polygon):
+            candidates.append((cy, cx, s))
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda t: (t[0], t[1]))  # top-most (smallest y), then left-most
+    return candidates[0][2]
+
 # -----------------------------
-# Extraction — SAME as your “working” pattern
-# (no value rebuild, no merging; just cell.content + confidence fallback)
+# Extraction — same as before, with top-most override when needed
 # -----------------------------
 def extract_tables_with_confidence(uploaded_file):
     pdf_bytes = uploaded_file.read()
@@ -118,7 +140,18 @@ def extract_tables_with_confidence(uploaded_file):
 
         for cell in table.cells:
             r, c = cell.row_index, cell.column_index
-            grid_vals[r][c] = cell.content or ""  # <- exactly the original behavior
+            value = (cell.content or "").strip()
+
+            # If the cell text contains 2+ numeric groups of length 3..5 (e.g., '3216 2860'),
+            # pick the TOP-MOST numeric token inside the polygon.
+            if len(re.findall(r"\d{3,5}", value)) >= 2 and cell.bounding_regions:
+                br = cell.bounding_regions[0]
+                page = pages.get(br.page_number)
+                chosen = _topmost_numeric_from_words(page, br.polygon, 3, 5)
+                if chosen:
+                    value = chosen
+
+            grid_vals[r][c] = value
 
             # confidence: cell.conf or mean of word confidences inside polygon
             conf = getattr(cell, "confidence", None)
@@ -145,7 +178,7 @@ def extract_tables_with_confidence(uploaded_file):
             df_conf.columns = df_vals.columns
             df_vals = df_vals[1:].reset_index(drop=True)
             df_conf = df_conf[1:].reset_index(drop=True)
-            df_vals = sanitize_mc_rpm(df_vals)  # tidy only MC/RPM
+            df_vals = sanitize_mc_rpm(df_vals)
 
         out.append({"values": df_vals, "scores": df_conf})
 
