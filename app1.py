@@ -18,6 +18,7 @@ from st_aggrid import (
     GridUpdateMode,
     JsCode,
     AgGridTheme,
+    DataReturnMode,  # ⬅️ added
 )
 
 # -----------------------------
@@ -187,7 +188,7 @@ def extract_tables_with_confidence(uploaded_file):
 # -----------------------------
 # AG-Grid editor — yellow/red only, with SAFE field ids
 # -----------------------------
-def aggrid_editor_yellow_red(df_vals, df_conf, yellow_cut=0.50, green_cut=0.70, height=460):
+def aggrid_editor_yellow_red(df_vals, df_conf, yellow_cut=0.50, green_cut=0.70, height=460, grid_key=None):
     """
     Uses safe field ids so headers like 'Revolution 10:30' render properly.
     Returns DataFrame with ORIGINAL column names.
@@ -235,14 +236,21 @@ def aggrid_editor_yellow_red(df_vals, df_conf, yellow_cut=0.50, green_cut=0.70, 
         gob.configure_column(safe, header_name=str(orig), editable=True, cellStyle=js_style)
         gob.configure_column(f"__conf__{safe}", hide=True, editable=False)
 
+    # ✅ Ensure edits commit when focus leaves the cell
+    gob.configure_grid_options(stopEditingWhenCellsLoseFocus=True)
+
     grid = AgGrid(
         merged,
         gridOptions=gob.build(),
-        update_mode=GridUpdateMode.VALUE_CHANGED,
+        # ✅ Return the live input model
+        data_return_mode=DataReturnMode.AS_INPUT,
+        # ✅ Push updates whenever model changes
+        update_mode=GridUpdateMode.MODEL_CHANGED,
         allow_unsafe_jscode=True,
         fit_columns_on_grid_load=True,
         theme=AgGridTheme.STREAMLIT,
         height=height,
+        key=grid_key,  # ✅ unique key per table instance
     )
 
     edited = pd.DataFrame(grid["data"])
@@ -276,7 +284,11 @@ if files:
 
             st.markdown(f"**Table {i} – Editable (yellow/red only)**")
             edited_values = aggrid_editor_yellow_red(
-                df_vals, df_conf, yellow_cut=yellow_cut, green_cut=green_cut
+                df_vals,
+                df_conf,
+                yellow_cut=yellow_cut,
+                green_cut=green_cut,
+                grid_key=f"{up.name}_table_{i}",  # ✅ unique key so state doesn't collide
             )
 
             st.download_button(
