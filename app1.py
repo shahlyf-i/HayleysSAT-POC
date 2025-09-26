@@ -1,7 +1,4 @@
-# app1.py — Original extraction + MC/RPM tidy + yellow/red highlights
-# Plus: when a cell has multiple 3–5 digit numbers (e.g., corrected value
-# written above the old one), keep the TOP-MOST number only.
-# pip install -U streamlit streamlit-aggrid azure-ai-documentintelligence pandas
+# app1.py — Editable tables with deferred "Save Changes" + cached extraction + download after save
 
 import re
 import math
@@ -18,19 +15,29 @@ from st_aggrid import (
     GridUpdateMode,
     JsCode,
     AgGridTheme,
-    DataReturnMode,  # ⬅️ added
+    DataReturnMode,
 )
 
 # -----------------------------
 # Secrets
 # -----------------------------
+st.set_page_config(page_title="PDF Table Extractor (yellow/red highlights)", layout="wide")
 endpoint = st.secrets["ENDPOINT"]
 key = st.secrets["KEY"]
 model_id = st.secrets["MODEL_ID"]
 client = DocumentIntelligenceClient(endpoint=endpoint, credential=AzureKeyCredential(key))
 
 # -----------------------------
-# Helpers
+# Session state init  ✅
+# -----------------------------
+if "edited_tables" not in st.session_state:
+    # structure: st.session_state.edited_tables[(filename, table_index)] = pd.DataFrame
+    st.session_state.edited_tables = {}
+if "extract_cache_debug" not in st.session_state:
+    st.session_state.extract_cache_debug = {}
+
+# -----------------------------
+# Helpers (unchanged)
 # -----------------------------
 def deduplicate_columns(columns):
     seen, out = {}, []
@@ -67,11 +74,10 @@ def normalize_conf(v):
         v = float(v)
     except Exception:
         return math.nan
-    if v > 1.0:  # sometimes 0..100
+    if v > 1.0:
         v /= 100.0
     return max(0.0, min(1.0, v))
 
-# Keep only left-most for MC, first two digits for RPM
 def _leftmost_digits(text: str) -> str:
     m = re.search(r'\d+', str(text))
     return m.group(0) if m else str(text)
@@ -91,11 +97,7 @@ def sanitize_mc_rpm(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = df[col].astype(str).map(_leftmost_two_digits)
     return df
 
-# ---- NEW: choose TOP-MOST numeric token when multiple numbers are present ----
 def _topmost_numeric_from_words(page, polygon, min_len=3, max_len=5):
-    """
-    Return the top-most token that is purely numeric with length in [min_len, max_len].
-    """
     if not page or not getattr(page, "words", None) or not polygon:
         return ""
     candidates = []
@@ -110,14 +112,18 @@ def _topmost_numeric_from_words(page, polygon, min_len=3, max_len=5):
             candidates.append((cy, cx, s))
     if not candidates:
         return ""
-    candidates.sort(key=lambda t: (t[0], t[1]))  # top-most (smallest y), then left-most
+    candidates.sort(key=lambda t: (t[0], t[1]))
     return candidates[0][2]
 
 # -----------------------------
-# Extraction — same as before, with top-most override when needed
+# Cached extraction  ✅
 # -----------------------------
-def extract_tables_with_confidence(uploaded_file):
-    pdf_bytes = uploaded_file.read()
+@st.cache_data(show_spinner=False, max_entries=64)
+def extract_tables_with_confidence_from_bytes(pdf_bytes: bytes):
+    """
+    Cached heavy call. Keyed by bytes content (safe for small/medium PDFs).
+    Returns list of {values: df, scores: df}
+    """
     poller = client.begin_analyze_document(
         model_id=model_id,
         body=pdf_bytes,
@@ -143,8 +149,6 @@ def extract_tables_with_confidence(uploaded_file):
             r, c = cell.row_index, cell.column_index
             value = (cell.content or "").strip()
 
-            # If the cell text contains 2+ numeric groups of length 3..5 (e.g., '3216 2860'),
-            # pick the TOP-MOST numeric token inside the polygon.
             if len(re.findall(r"\d{3,5}", value)) >= 2 and cell.bounding_regions:
                 br = cell.bounding_regions[0]
                 page = pages.get(br.page_number)
@@ -154,7 +158,6 @@ def extract_tables_with_confidence(uploaded_file):
 
             grid_vals[r][c] = value
 
-            # confidence: cell.conf or mean of word confidences inside polygon
             conf = getattr(cell, "confidence", None)
             if conf is None and cell.bounding_regions:
                 br = cell.bounding_regions[0]
@@ -186,17 +189,12 @@ def extract_tables_with_confidence(uploaded_file):
     return out
 
 # -----------------------------
-# AG-Grid editor — yellow/red only, with SAFE field ids
+# AG-Grid editor (unchanged core); we don't persist here  ✅
 # -----------------------------
 def aggrid_editor_yellow_red(df_vals, df_conf, yellow_cut=0.50, green_cut=0.70, height=460, grid_key=None):
-    """
-    Uses safe field ids so headers like 'Revolution 10:30' render properly.
-    Returns DataFrame with ORIGINAL column names.
-    """
     if df_vals.empty:
         return df_vals.copy()
 
-    # Build safe ids for AG Grid fields
     orig_cols = list(df_vals.columns)
     safe_cols, used = [], set()
     for c in orig_cols:
@@ -206,7 +204,6 @@ def aggrid_editor_yellow_red(df_vals, df_conf, yellow_cut=0.50, green_cut=0.70, 
         used.add(k)
         safe_cols.append(k)
 
-    # Re-label values and conf with safe ids
     vals_display = df_vals.copy()
     vals_display.columns = safe_cols
 
@@ -215,7 +212,6 @@ def aggrid_editor_yellow_red(df_vals, df_conf, yellow_cut=0.50, green_cut=0.70, 
 
     merged = pd.concat([vals_display, conf_display], axis=1)
 
-    # Yellow if >= yellow_cut and < green_cut; Red if < yellow_cut; no green fill
     js_style = JsCode(f"""
         function(params){{
             var k = "__conf__" + params.colDef.field;
@@ -236,32 +232,29 @@ def aggrid_editor_yellow_red(df_vals, df_conf, yellow_cut=0.50, green_cut=0.70, 
         gob.configure_column(safe, header_name=str(orig), editable=True, cellStyle=js_style)
         gob.configure_column(f"__conf__{safe}", hide=True, editable=False)
 
-    # ✅ Ensure edits commit when focus leaves the cell
     gob.configure_grid_options(stopEditingWhenCellsLoseFocus=True)
 
     grid = AgGrid(
         merged,
         gridOptions=gob.build(),
-        # ✅ Return the live input model
         data_return_mode=DataReturnMode.AS_INPUT,
-        # ✅ Push updates whenever model changes
+        # Important: edits may cause reruns, but caching prevents heavy work
         update_mode=GridUpdateMode.MODEL_CHANGED,
         allow_unsafe_jscode=True,
         fit_columns_on_grid_load=True,
         theme=AgGridTheme.STREAMLIT,
         height=height,
-        key=grid_key,  # ✅ unique key per table instance
+        key=grid_key,
     )
 
     edited = pd.DataFrame(grid["data"])
     edited_vals = edited[safe_cols].copy()
-    edited_vals.columns = orig_cols  # map back to original headers
+    edited_vals.columns = orig_cols
     return edited_vals
 
 # -----------------------------
 # UI
 # -----------------------------
-st.set_page_config(page_title="PDF Table Extractor (yellow/red highlights)", layout="wide")
 st.title("Custom PDF Table Extractor (Azure Document Intelligence)")
 
 files = st.file_uploader("Upload one or more PDF files", type=["pdf"], accept_multiple_files=True)
@@ -271,8 +264,10 @@ if files:
     yellow_cut = st.slider("Yellow when ≥", 30, 69, 50, 1) / 100.0
 
     for up in files:
+        pdf_bytes = up.getvalue()  # ✅ stable bytes for cache key
+        # cache hit indicator (optional)
+        tables = extract_tables_with_confidence_from_bytes(pdf_bytes)
         st.subheader(f"Results for: {up.name}")
-        tables = extract_tables_with_confidence(up)
         if not tables:
             st.warning("No tables detected in this PDF.")
             continue
@@ -282,18 +277,38 @@ if files:
             pct_scored = (df_conf.notna().sum().sum() / df_conf.size * 100) if df_conf.size else 0
             st.caption(f"Cells with confidence available: {pct_scored:.1f}%")
 
-            st.markdown(f"**Table {i} – Editable (yellow/red only)**")
-            edited_values = aggrid_editor_yellow_red(
-                df_vals,
-                df_conf,
-                yellow_cut=yellow_cut,
-                green_cut=green_cut,
-                grid_key=f"{up.name}_table_{i}",  # ✅ unique key so state doesn't collide
-            )
+            st.markdown(f"**Table {i} – Edit cells, then click _Save Changes_**")
+            grid_key = f"{up.name}_table_{i}"
 
-            st.download_button(
-                f"Download Edited Table {i} as CSV",
-                edited_values.to_csv(index=False).encode("utf-8"),
-                file_name=f"{up.name}_table{i}_edited.csv",
-                mime="text/csv",
-            )
+            # Use an expander + form so the *save* is an explicit action  ✅
+            with st.expander(f"Open Table {i}", expanded=True):
+                with st.form(key=f"form_{grid_key}"):
+                    edited_values_live = aggrid_editor_yellow_red(
+                        df_vals, df_conf,
+                        yellow_cut=yellow_cut,
+                        green_cut=green_cut,
+                        grid_key=grid_key,
+                    )
+
+                    # Only persist when the user clicks this  ✅
+                    saved = st.form_submit_button("Save Changes")
+
+                    if saved:
+                        st.session_state.edited_tables[(up.name, i)] = edited_values_live
+                        st.success("Changes saved for this table.")
+
+            # If saved before, show the saved preview and download  ✅
+            saved_key = (up.name, i)
+            if saved_key in st.session_state.edited_tables:
+                saved_df = st.session_state.edited_tables[saved_key]
+                st.dataframe(saved_df, use_container_width=True)
+                st.download_button(
+                    f"Download Edited Table {i} as CSV",
+                    saved_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"{up.name}_table{i}_edited.csv",
+                    mime="text/csv",
+                    key=f"dl_{grid_key}",
+                )
+            else:
+                # Not saved yet — let user know  ✅
+                st.info("Edit cells above, then click **Save Changes** to enable download.")
